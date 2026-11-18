@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Domoticz - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status, help
+
+RUN_ID="${RUN_ID:-default}"
+PORT="${PORT:-8093}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.tester-env.yml"
+
+CREDENTIALS_USER="admin"
+CREDENTIALS_PASSWORD="domoticz"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    CONTAINER_NAME="tester-env-domoticz${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-domoticz:dev}"
+    COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-tester-env-domoticz${suffix}}"
+    DATA_VOLUME="${DATA_VOLUME:-domoticz-data${suffix}}"
+    APP_URL="${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}"
+}
+
+compose() {
+    docker compose \
+        -p "${COMPOSE_PROJECT}" \
+        -f "${COMPOSE_FILE}" \
+        --project-directory "${SCRIPT_DIR}" \
+        "$@"
+}
+
+compose_env() {
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}" \
+    CONTAINER_NAME="${CONTAINER_NAME}" \
+    IMAGE_TAG="${IMAGE_NAME}" \
+    PORT="${PORT}" \
+    DATA_VOLUME="${DATA_VOLUME}" \
+    DOMOTICZ_ADMIN_USERNAME="${CREDENTIALS_USER}" \
+    DOMOTICZ_ADMIN_PASSWORD="${CREDENTIALS_PASSWORD}" \
+    compose "$@"
+}
+
+wait_for_health() {
+    local attempt
+    for attempt in $(seq 1 90); do
+        if curl -sf "http://localhost:${PORT}/" >/dev/null 2>&1; then
+            echo "==> App healthy after ${attempt}s"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Error: app did not become healthy at http://localhost:${PORT}/" >&2
+    compose_env logs --tail 80 >&2 || true
+    exit 1
+}
+
+cmd_deploy() {
+    echo "==> Building image from source: ${IMAGE_NAME}..."
+    echo "    (cold build compiles the Domoticz binary; source-only edits reuse the /build cache)"
+    compose_env build
+
+    echo "==> Starting container ${CONTAINER_NAME} on port ${PORT}..."
+    compose_env up -d --no-build
+
+    wait_for_health
+
+    echo "==> Deployment complete."
+    echo "    URL:         http://localhost:${PORT}/"
+    echo "    Browser URL: ${APP_URL}/"
+    echo "    Login:       ${CREDENTIALS_USER} / ${CREDENTIALS_PASSWORD}"
+}
+
+require_running() {
+    if ! compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Error: container ${CONTAINER_NAME} is not running. Run './tester-env deploy' first." >&2
+        exit 1
+    fi
+}
+
+cmd_seed() {
+    require_running
+    echo "==> Seeding household data over the JSON API..."
+
+    python3 - "http://localhost:${PORT}" "${CREDENTIALS_USER}" "${CREDENTIALS_PASSWORD}" <<'PY'
+import base64
+import hashlib
+import http.cookiejar
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+base, user, password = sys.argv[1:4]
+jar = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+# Every command is a POST, mirroring the Angular frontend and the admin forms.
+def api(param, query=None, form=None):
+    params = {"type": "command", "param": param}
+    params.update(query or {})
+    url = base + "/json.htm?" + urllib.parse.urlencode(params)
+    body = urllib.parse.urlencode(form).encode() if form is not None else b""
+    try:
+        with opener.open(urllib.request.Request(url, data=body), timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"seed: HTTP {exc.code} on {param}")
+    except urllib.error.URLError as exc:
+        sys.exit(f"seed: cannot reach {base}: {exc.reason}")
+
+
+def need_ok(result, what):
+    if result.get("status") != "OK":
+        sys.exit(f"seed: {what} failed: {result}")
+
+
+need_ok(api("logincheck", form={
+    "username": base64.b64encode(user.encode()).decode(),
+    "password": hashlib.md5(password.encode()).hexdigest(),
+    "rememberme": "false",
+}), "login")
+
+HUB = "Maple Street Hub"
+# Names, order, types and target values are fixed: this is the whole baseline.
+DEVICES = [
+    ("Living Room Lamp", 244, 73, "switch", "On"),
+    ("Kitchen Ceiling Light", 244, 73, "switch", "Off"),
+    ("Porch Light", 244, 73, "switch", "On"),
+    ("Outdoor Temperature", 80, 5, "value", "18.5"),
+    ("Hallway Thermostat", 242, 1, "value", "21.0"),
+]
+ROOMS = {
+    "Living Room": ["Living Room Lamp", "Outdoor Temperature"],
+    "Kitchen": ["Kitchen Ceiling Light"],
+    "Hallway": ["Porch Light", "Hallway Thermostat"],
+}
+FAVORITES = ["Living Room Lamp", "Outdoor Temperature"]
+
+
+def device_map():
+    return {d["Name"]: d for d in api("getdevices", {"filter": "all", "used": "true"}).get("result", [])}
+
+
+def plan_map():
+    return {p["Name"]: p for p in api("getplans").get("result", [])}
+
+
+# Idempotent: reuse the fixed hardware row, create it only when absent.
+hub_idx = next((hw["idx"] for hw in api("gethardware").get("result", []) if hw.get("Name") == HUB), None)
+if hub_idx is None:
+    result = api("addhardware", form={"name": HUB, "enabled": "true", "htype": "15", "loglevel": "1"})
+    need_ok(result, "addhardware")
+    hub_idx = result["idx"]
+print(f"    hardware: {HUB} (Dummy, idx {hub_idx})")
+
+known = device_map()
+for name, devicetype, subtype, _kind, _value in DEVICES:
+    if name not in known:
+        need_ok(api("createdevice", form={
+            "idx": hub_idx,
+            "sensorname": name,
+            "devicetype": str(devicetype),
+            "devicesubtype": str(subtype),
+        }), f"createdevice {name}")
+
+known = device_map()
+missing = [name for name, *_ in DEVICES if name not in known]
+if missing:
+    sys.exit("seed: devices missing after create: " + ", ".join(missing))
+
+# Re-apply fixed states so a reseed also repairs drift.
+for name, _devicetype, _subtype, kind, value in DEVICES:
+    dev_idx = known[name]["idx"]
+    if kind == "switch":
+        need_ok(api("switchlight", {"idx": dev_idx, "switchcmd": value}), f"switch {name}")
+    else:
+        need_ok(api("udevice", {"idx": dev_idx, "nvalue": "0"}, {"svalue": value}), f"update {name}")
+
+current_plans = plan_map()
+for room, members in ROOMS.items():
+    if room in current_plans:
+        room_idx = current_plans[room]["idx"]
+    else:
+        result = api("addplan", form={"name": room})
+        need_ok(result, f"addplan {room}")
+        room_idx = result["idx"]
+    for member in members:
+        need_ok(api("addplanactivedevice", {
+            "idx": room_idx,
+            "activetype": "0",
+            "activeidx": known[member]["idx"],
+        }), f"add {member} to {room}")
+
+for name in FAVORITES:
+    need_ok(api("makefavorite", {"idx": known[name]["idx"], "isfavorite": "1"}), f"favorite {name}")
+
+print(f"    devices: {len(DEVICES)} virtual devices with fixed states")
+print(f"    rooms:   {', '.join(ROOMS)}")
+print(f"    favorites: {', '.join(FAVORITES)}")
+PY
+
+    echo "==> Seed complete."
+}
+
+cmd_verify() {
+    require_running
+    echo "==> Verifying app, login, seeded devices, rooms and favorites..."
+
+    python3 - "http://localhost:${PORT}" "${CREDENTIALS_USER}" "${CREDENTIALS_PASSWORD}" <<'PY'
+import base64
+import hashlib
+import http.cookiejar
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+base, user, password = sys.argv[1:4]
+jar = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+def fail(message):
+    sys.exit(f"verify: FAIL {message}")
+
+
+def api(param, query=None, form=None):
+    params = {"type": "command", "param": param}
+    params.update(query or {})
+    url = base + "/json.htm?" + urllib.parse.urlencode(params)
+    body = urllib.parse.urlencode(form).encode() if form is not None else b""
+    try:
+        with opener.open(urllib.request.Request(url, data=body), timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        fail(f"{param} request failed: {exc}")
+
+
+def expect_ok(result, what):
+    if result.get("status") != "OK":
+        fail(f"{what}: {result}")
+    print(f"    {what}")
+
+
+# Baseline contract: page, admin login, authenticated API and www assets.
+try:
+    with opener.open(base + "/", timeout=30) as resp:
+        if resp.status != 200:
+            fail(f"page / returned HTTP {resp.status}")
+except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+    fail(f"page / is not responding: {exc}")
+print("    page: / responds")
+
+expect_ok(api("logincheck", form={
+    "username": base64.b64encode(user.encode()).decode(),
+    "password": hashlib.md5(password.encode()).hexdigest(),
+    "rememberme": "false",
+}), f"login: {user} -> status OK")
+
+expect_ok(api("getconfig"), "api: authenticated getconfig -> status OK")
+
+try:
+    with opener.open(base + "/app/app.js", timeout=30) as resp:
+        if resp.status != 200:
+            fail(f"/app/app.js returned HTTP {resp.status}")
+except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+    fail(f"/app/app.js is not served: {exc}")
+print("    assets: /app/app.js serves")
+
+# Seeded inventory: one enabled Dummy hardware row.
+hub = [hw for hw in api("gethardware").get("result", []) if hw.get("Name") == "Maple Street Hub"]
+if len(hub) != 1 or str(hub[0].get("Type")) != "15" or hub[0].get("Enabled") != "true":
+    fail(f"expected exactly one enabled Dummy hardware 'Maple Street Hub', got {hub}")
+print("    hardware: Maple Street Hub (Dummy, enabled)")
+
+EXPECTED = {
+    "Living Room Lamp": {"Status": "On", "Favorite": 1},
+    "Kitchen Ceiling Light": {"Status": "Off", "Favorite": 0},
+    "Porch Light": {"Status": "On", "Favorite": 0},
+    "Outdoor Temperature": {"Temp": 18.5, "Favorite": 1},
+    "Hallway Thermostat": {"SetPoint": 21.0, "Favorite": 0},
+}
+devices = {d["Name"]: d for d in api("getdevices", {"filter": "all", "used": "true"}).get("result", [])}
+if set(devices) != set(EXPECTED):
+    fail(f"device inventory mismatch: expected {sorted(EXPECTED)}, got {sorted(devices)}")
+for name, fields in EXPECTED.items():
+    for field, value in fields.items():
+        actual = devices[name].get(field)
+        if isinstance(value, float):
+            try:
+                actual = float(actual)
+            except (TypeError, ValueError):
+                fail(f"{name}: {field} is not a number ({actual!r})")
+            if abs(actual - value) > 0.01:
+                fail(f"{name}: {field} expected {value}, got {actual}")
+        elif actual != value:
+            fail(f"{name}: {field} expected {value!r}, got {actual!r}")
+print("    devices: 5 virtual devices with expected states and favorites")
+
+favorites = {d["Name"] for d in api("getdevices", {"filter": "all", "used": "true", "favorite": "1"}).get("result", [])}
+if favorites != {"Living Room Lamp", "Outdoor Temperature"}:
+    fail(f"favorite filter expected two devices, got {sorted(favorites)}")
+print("    favorites: dashboard shows Living Room Lamp and Outdoor Temperature")
+
+EXPECTED_ROOMS = {"Living Room": 2, "Kitchen": 1, "Hallway": 2}
+plans = {p["Name"]: p for p in api("getplans").get("result", [])}
+if {name: int(p["Devices"]) for name, p in plans.items()} != EXPECTED_ROOMS:
+    fail(f"room plan counts expected {EXPECTED_ROOMS}, got {[(n, p.get('Devices')) for n, p in plans.items()]}")
+living = api("getplandevices", {"idx": plans["Living Room"]["idx"]}).get("result", [])
+if {d["Name"] for d in living} != {"Living Room Lamp", "Outdoor Temperature"}:
+    fail(f"Living Room plan members mismatch: {sorted(d['Name'] for d in living)}")
+print("    rooms: Living Room 2, Kitchen 1, Hallway 2")
+PY
+
+    echo "==> Verify passed."
+}
+
+cmd_reset() {
+    echo "==> Resetting environment..."
+    compose_env down -v --remove-orphans || true
+    echo "==> Reset complete (container and data volume removed). Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping container (data preserved)..."
+    compose_env stop
+}
+
+cmd_logs() {
+    compose_env logs -f --tail 100 "$@"
+}
+
+cmd_status() {
+    if compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}/"
+        echo "Browser URL: ${APP_URL}/"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: ${IMAGE_NAME}"
+        echo "Data volume: ${DATA_VOLUME}"
+        echo "Credentials: ${CREDENTIALS_USER} / ${CREDENTIALS_PASSWORD}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Domoticz - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the image from source, start the container, wait for HTTP
+  seed      Create the fixed household data (Dummy hardware, virtual devices,
+            room plans and dashboard favorites) through the JSON API
+  verify    Assert page, admin login, seeded devices/states, room counts and
+            favorites over HTTP
+  reset     Remove container and data volume
+  stop      Stop the container (data preserved)
+  logs      Tail container logs
+  status    Show container status, URL and credentials
+  help      Show this help message
+
+Options:
+  --run-id <id>   Isolate container, compose project and data volume. Default: default
+  --port <port>   Host port to bind to container port 8080. Default: 8093
+
+Typical workflow:
+  ./tester-env deploy    # Build, start
+  ./tester-env seed      # Populate deterministic household data
+  ./tester-env verify    # Check login, API and seeded state
+  ./tester-env reset     # Clean slate
+
+Seeded baseline:
+  - "Maple Street Hub" Dummy hardware with five virtual devices:
+    Living Room Lamp (On), Kitchen Ceiling Light (Off), Porch Light (On),
+    Outdoor Temperature 18.5 C, Hallway Thermostat setpoint 21.0.
+  - Room plans: Living Room (2 devices), Kitchen (1), Hallway (2).
+  - Favorites: Living Room Lamp and Outdoor Temperature.
+  Seed is idempotent: rerunning it repairs state without duplicating rows.
+
+Deployment details:
+  - Upstream 2026.4 (cc668a12b6ef9334928ae1fec6a7d20876e1f9f8), built from
+    editable source with submodules; sqlite/jsoncpp/minizip/jwt-cpp bundled.
+  - Runtime: Dummy/HTTP hardware only, no USB/I2C/SPI/OpenZWave.
+  - Server: -www 8080 -sslwww 0 -nomdns -noupdates -nomcp; DB in /data volume.
+  - Admin comes from DOMOTICZ_ADMIN_USERNAME/PASSWORD on first start.
+
+Environment:
+  IMAGE_TAG        Content-addressed image tag exported by scripts/rl-env
+  RUN_ID           Scopes container, compose project and data volume
+  PORT             Host port (default 8093)
+  TESTER_ENV_BROWSER_ORIGIN  Browser-visible origin printed by status
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id)
+                RUN_ID="${2:?--run-id requires a value}"
+                shift 2
+                ;;
+            --port)
+                PORT="${2:?--port requires a value}"
+                shift 2
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

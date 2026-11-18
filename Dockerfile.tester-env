@@ -1,0 +1,92 @@
+# syntax=docker/dockerfile:1.7
+# Domoticz source build for tester-env. Upstream build/Dockerfile is Debian
+# buster and compiles CMake/Boost from source; this build uses current distro
+# packages and only compiles the application.
+FROM debian:bookworm-slim AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      git \
+      libboost-dev \
+      libboost-thread-dev \
+      libcurl4-openssl-dev \
+      liblua5.3-dev \
+      libmosquitto-dev \
+      libssl-dev \
+      uthash-dev \
+      zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Submodules are fetched at pinned SHAs instead of copied from the context so
+# that builds also work from git worktrees, where submodule contents are absent.
+RUN set -eux; \
+    clone_at() { \
+      dir="$1"; url="$2"; sha="$3"; \
+      if [ ! -f "$dir/CMakeLists.txt" ]; then \
+        rm -rf "$dir"; \
+        git clone --quiet "$url" "$dir"; \
+        git -C "$dir" checkout --quiet "$sha"; \
+      fi; \
+    }; \
+    clone_at extern/jsoncpp https://github.com/open-source-parsers/jsoncpp.git 89e2973c754a9c02a49974d839779b151e95afd6; \
+    clone_at extern/jwtcpp https://github.com/Thalhammer/jwt-cpp 3e037df3e669633a3044618e30550ea2f212e915; \
+    clone_at extern/libwebem https://github.com/domoticz/libwebem.git dde28f230efefa279aceb92f039ea251b34234d8; \
+    clone_at extern/minizip https://github.com/domoticz/minizip.git aee7fbddf118d9363575af96310c29fa747d70c0; \
+    clone_at extern/sqlite-amalgamation https://github.com/algoritnl/sqlite-cmake.git 66f3bd9326fa83160743a890ab9b2abe35000211
+
+COPY . .
+
+# /build is a BuildKit cache mount: it survives rebuilds of this layer, so a
+# mutated source file recompiles only its translation units and relinks.
+RUN --mount=type=cache,target=/build,sharing=locked \
+    cmake -S /src -B /build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/domoticz \
+      -DUSE_BUILTIN_JSONCPP=YES \
+      -DUSE_BUILTIN_MINIZIP=YES \
+      -DUSE_BUILTIN_SQLITE=YES \
+      -DUSE_BUILTIN_JWTCPP=YES \
+      -DUSE_PYTHON=NO \
+      -DINCLUDE_LINUX_I2C=NO \
+      -DINCLUDE_SPI=NO \
+      -DWITH_LIBUSB=NO \
+      -DUSE_LUA_STATIC=NO \
+      -DUSE_STATIC_BOOST=NO \
+      -DUSE_STATIC_OPENZWAVE=NO \
+      -DDISABLE_UPDATER=YES \
+      -DBUILD_MASTER=YES \
+      -DGIT_SUBMODULE=OFF \
+ && cmake --build /build -j"$(nproc)" \
+ && cmake --install /build
+
+FROM debian:bookworm-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      libboost-thread1.74.0 \
+      libcurl4 \
+      liblua5.3-0 \
+      libmosquitto1 \
+      libssl3 \
+      tzdata \
+      zlib1g \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/domoticz /opt/domoticz
+
+WORKDIR /opt/domoticz
+VOLUME ["/data"]
+EXPOSE 8080
+
+ENTRYPOINT ["/opt/domoticz/domoticz"]
+CMD ["-www", "8080", "-wwwbind", "0.0.0.0", "-sslwww", "0", \
+     "-nomdns", "-noupdates", "-nomcp", \
+     "-approot", "/opt/domoticz", "-userdata", "/data"]

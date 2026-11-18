@@ -1,0 +1,18 @@
+services:
+  domoticz:
+    build:
+      context: .
+      dockerfile: Dockerfile.tester-env
+    image: ${IMAGE_TAG:-tester-env-domoticz:dev}
+    container_name: ${CONTAINER_NAME:-tester-env-domoticz}
+    ports:
+      - "${PORT:-8093}:8080"
+    environment:
+      DOMOTICZ_ADMIN_USERNAME: ${DOMOTICZ_ADMIN_USERNAME:-admin}
+      DOMOTICZ_ADMIN_PASSWORD: ${DOMOTICZ_ADMIN_PASSWORD:-domoticz}
+    volumes:
+      - domoticz-data:/data
+
+volumes:
+  domoticz-data:
+    name: ${DATA_VOLUME:-domoticz-data}

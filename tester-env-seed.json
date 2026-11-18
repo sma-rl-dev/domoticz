@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "app": "domoticz",
+  "requirements": {
+    "device-inventory": {
+      "status": "present",
+      "evidence": "Seed creates one enabled Dummy hardware 'Maple Street Hub' (htype 15) with five virtual devices: switches Living Room Lamp, Kitchen Ceiling Light, Porch Light; Outdoor Temperature; Hallway Thermostat."
+    },
+    "switch-state-variety": {
+      "status": "present",
+      "evidence": "Living Room Lamp and Porch Light start On, Kitchen Ceiling Light starts Off, so the Switches tab shows both states and a toggle produces a visible change."
+    },
+    "temperature-and-setpoint": {
+      "status": "present",
+      "evidence": "Outdoor Temperature is 18.5 C and Hallway Thermostat has setpoint 21.0, populating the Temperature tab and the setpoint detail view."
+    },
+    "room-plan-grouping": {
+      "status": "present",
+      "evidence": "Plans Living Room (Living Room Lamp, Outdoor Temperature), Kitchen (Kitchen Ceiling Light) and Hallway (Porch Light, Hallway Thermostat) show device counts 2, 1 and 2."
+    },
+    "favorites-dashboard": {
+      "status": "present",
+      "evidence": "Living Room Lamp and Outdoor Temperature are favorites, so the dashboard favorites filter lists exactly two devices."
+    }
+  }
+}
